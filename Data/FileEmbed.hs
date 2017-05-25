@@ -57,8 +57,6 @@ import Language.Haskell.TH.Syntax
     , Quasi(qAddDependentFile)
 #endif
     )
-import System.Directory (doesDirectoryExist, doesFileExist,
-                         getDirectoryContents, canonicalizePath)
 import Control.Exception (throw, ErrorCall(..))
 import Control.Monad (filterM)
 import qualified Data.ByteString as B
@@ -69,7 +67,39 @@ import Data.ByteString.Unsafe (unsafePackAddressLen)
 import System.IO.Unsafe (unsafePerformIO)
 import System.FilePath ((</>), takeDirectory, takeExtension)
 import Data.String (fromString)
-import Prelude as P
+import Prelude as P hiding (readFile)
+#if MIN_VERSION_template_haskell(2,13,0)
+import qualified Language.Haskell.TH.Syntax as TH
+#else
+import qualified Prelude as P
+import qualified System.Directory as Dir ( doesDirectoryExist
+                                         , doesFileExist
+                                         , getDirectoryContents
+                                         , canonicalizePath )
+#endif
+
+readFileBS :: FilePath -> Q B.ByteString
+readFile :: FilePath -> Q String
+doesFileExist :: FilePath -> Q Bool
+doesDirectoryExist :: FilePath -> Q Bool
+getDirectoryContents :: FilePath -> Q [FilePath]
+canonicalizePath :: FilePath -> Q FilePath
+
+#if MIN_VERSION_template_haskell(2,13,0)
+readFileBS           = TH.readFileBS
+readFile             = TH.readFile
+doesFileExist        = TH.doesFileExist
+doesDirectoryExist   = TH.doesDirectoryExist
+getDirectoryContents = TH.getDirectoryContents
+canonicalizePath     = TH.canonicalizePath
+#else
+readFileBS           = runIO . B.readFile
+readFile             = runIO . P.readFile
+doesFileExist        = runIO . Dir.doesFileExist
+doesDirectoryExist   = runIO . Dir.doesDirectoryExist
+getDirectoryContents = runIO . Dir.getDirectoryContents
+canonicalizePath     = runIO . Dir.canonicalizePath
+#endif
 
 -- | Embed a single file in your source code.
 --
@@ -82,7 +112,7 @@ embedFile fp =
 #if MIN_VERSION_template_haskell(2,7,0)
     qAddDependentFile fp >>
 #endif
-  (runIO $ B.readFile fp) >>= bsToExp
+  readFileBS fp >>= bsToExp
 
 -- | Embed a single existing file in your source code
 -- out of list a list of paths supplied.
@@ -93,19 +123,18 @@ embedFile fp =
 -- > myFile = $(embedFile' [ "dirName/fileName", "src/dirName/fileName" ])
 embedOneFileOf :: [FilePath] -> Q Exp
 embedOneFileOf ps =
-  (runIO $ readExistingFile ps) >>= \ ( path, content ) -> do
+    readExistingFile ps >>= \ ( path, content ) -> do
 #if MIN_VERSION_template_haskell(2,7,0)
     qAddDependentFile path
 #endif
     bsToExp content
   where
-    readExistingFile :: [FilePath] -> IO ( FilePath, B.ByteString )
+    readExistingFile :: [FilePath] -> Q ( FilePath, B.ByteString )
     readExistingFile xs = do
       ys <- filterM doesFileExist xs
       case ys of
-        (p:_) -> B.readFile p >>= \ c -> return ( p, c )
-        _ -> throw $ ErrorCall "Cannot find file to embed as resource"
-
+        (p:_) -> readFileBS p >>= \c -> return ( p, c )
+        _ -> runIO . throw $ ErrorCall "Cannot find file to embed as resource"
 -- | Embed a directory recursively in your source code.
 --
 -- > import qualified Data.ByteString
@@ -115,13 +144,13 @@ embedOneFileOf ps =
 embedDir :: FilePath -> Q Exp
 embedDir fp = do
     typ <- [t| [(FilePath, B.ByteString)] |]
-    e <- ListE <$> ((runIO $ fileList fp) >>= mapM (pairToExp fp))
+    e <- ListE <$> (fileList fp >>= mapM (pairToExp fp))
     return $ SigE e typ
 
 -- | Get a directory tree in the IO monad.
 --
 -- This is the workhorse of 'embedDir'
-getDir :: FilePath -> IO [(FilePath, B.ByteString)]
+getDir :: FilePath -> Q [(FilePath, B.ByteString)]
 getDir = fileList
 
 pairToExp :: FilePath -> (FilePath, B.ByteString) -> Q Exp
@@ -166,7 +195,7 @@ embedStringFile fp =
 #if MIN_VERSION_template_haskell(2,7,0)
     qAddDependentFile fp >>
 #endif
-  (runIO $ P.readFile fp) >>= strToExp
+  readFile fp >>= strToExp
 
 -- | Embed a single existing string file in your source code
 -- out of list a list of paths supplied.
@@ -174,18 +203,18 @@ embedStringFile fp =
 -- Since 0.0.9
 embedOneStringFileOf :: [FilePath] -> Q Exp
 embedOneStringFileOf ps =
-  (runIO $ readExistingFile ps) >>= \ ( path, content ) -> do
+  readExistingFile ps >>= \ ( path, content ) -> do
 #if MIN_VERSION_template_haskell(2,7,0)
     qAddDependentFile path
 #endif
     strToExp content
   where
-    readExistingFile :: [FilePath] -> IO ( FilePath, String )
+    readExistingFile :: [FilePath] -> Q ( FilePath, String )
     readExistingFile xs = do
       ys <- filterM doesFileExist xs
       case ys of
-        (p:_) -> P.readFile p >>= \ c -> return ( p, c )
-        _ -> throw $ ErrorCall "Cannot find file to embed as resource"
+        (p:_) -> readFile p >>= \ c -> return ( p, c )
+        _ -> runIO . throw $ ErrorCall "Cannot find file to embed as resource"
 
 strToExp :: String -> Q Exp
 #if MIN_VERSION_template_haskell(2, 5, 0)
@@ -202,15 +231,15 @@ notHidden :: FilePath -> Bool
 notHidden ('.':_) = False
 notHidden _ = True
 
-fileList :: FilePath -> IO [(FilePath, B.ByteString)]
+fileList :: FilePath -> Q [(FilePath, B.ByteString)]
 fileList top = fileList' top ""
 
-fileList' :: FilePath -> FilePath -> IO [(FilePath, B.ByteString)]
+fileList' :: FilePath -> FilePath -> Q [(FilePath, B.ByteString)]
 fileList' realTop top = do
     allContents <- filter notHidden <$> getDirectoryContents (realTop </> top)
     let all' = map ((top </>) &&& (\x -> realTop </> top </> x)) allContents
     files <- filterM (doesFileExist . snd) all' >>=
-             mapM (liftPair2 . second B.readFile)
+             mapM (liftPair2 . second readFileBS)
     dirs <- filterM (doesDirectoryExist . snd) all' >>=
             mapM (fileList' realTop . fst)
     return $ concat $ files : dirs
@@ -360,7 +389,7 @@ available, you can use the non-@With@ variants.
 makeRelativeToProject :: FilePath -> Q FilePath
 makeRelativeToProject rel = do
     loc <- qLocation
-    runIO $ do
+    do
         srcFP <- canonicalizePath $ loc_filename loc
         mdir <- findProjectDir srcFP
         case mdir of
